@@ -1,0 +1,126 @@
+import cv2
+import mediapipe as mp
+import time
+import numpy as np
+
+# Initialize Mediapipe Face Mesh(Has 468 landmarks that keep track of your facial features)
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True)
+
+# Load emoji images
+winking_img = cv2.imread("winking.png", cv2.IMREAD_UNCHANGED) #stores the wink image in a variable without changing its properties e.g png
+smile_img = cv2.imread("smile.png", cv2.IMREAD_UNCHANGED)     #stores the smile image in a variable without changing its properties
+
+# Overlay function (for transparency support) - Also ensures the image has the right color channels i.e RGBA (A is alpha channel which determines the opacity of a pixel) 
+def overlay_emoji(base_img, emoji):
+    if emoji is None:
+        return base_img
+    emoji_resized = cv2.resize(emoji, (640, 480))
+    eh, ew, ec = emoji_resized.shape
+    bg = base_img.copy()
+
+    if ec == 4:
+        alpha = emoji_resized[:, :, 3] / 255.0
+        for c in range(3):
+            bg[:, :, c] = bg[:, :, c] * (1 - alpha) + emoji_resized[:, :, c] * alpha
+    else:
+        bg = emoji_resized
+    return bg
+
+
+# Wink detection
+wink_frames = 0
+def is_winking(landmarks):
+    global wink_frames
+    left_eye = [33, 160, 158, 133]
+    right_eye = [362, 385, 387, 263]
+
+    def eye_aspect(eye_indices):
+        top = (landmarks[eye_indices[1]].y + landmarks[eye_indices[2]].y) / 2
+        bottom = landmarks[eye_indices[0]].y
+        vertical_dist = abs(top - bottom) #Helps in determining the height of an eyelid which is crucial for the wink detection
+        horizontal_dist = abs(landmarks[eye_indices[3]].x - landmarks[eye_indices[0]].x) #Eye width
+        return vertical_dist / horizontal_dist
+
+    left_ratio = eye_aspect(left_eye)
+    right_ratio = eye_aspect(right_eye)
+    ratio_diff = abs(left_ratio - right_ratio)
+
+    # less sensitive wink
+    if ratio_diff > 0.08:
+        wink_frames += 1 
+    else:
+        wink_frames = max(0, wink_frames - 1)
+
+    return wink_frames > 3 
+    
+    #This helps to determine whether a proper wink has occured by capturing the frames that have a probable wink
+
+
+# Smile detection
+def is_smiling(landmarks):
+    left_mouth = landmarks[61]
+    right_mouth = landmarks[291]
+    top_lip = landmarks[13]
+    bottom_lip = landmarks[14]
+
+    mouth_width = abs(right_mouth.x - left_mouth.x)
+    mouth_height = abs(top_lip.y - bottom_lip.y)
+    return (mouth_height / mouth_width) > 0.25
+
+
+# Main
+def main():
+    cap = cv2.VideoCapture(0) # Opens the laptop camera
+    cv2.namedWindow("Camera", cv2.WINDOW_NORMAL) #displays the camera window
+    cv2.namedWindow("Emoji Display", cv2.WINDOW_NORMAL) #displays the 'emoji' window
+
+    last_expression = None # Tracks the last expression detected
+    display_until = 0   #Tracks the time limit that an expression image can be displayed for
+    blank_display = (255 * np.ones((480, 640, 3), dtype=np.uint8)) # White background
+
+    while cap.isOpened():
+        ret, frame = cap.read() # Keeps track of frames
+        if not ret:
+            break
+
+        frame = cv2.flip(frame, 1) #Flips the camera horizontally(mirror image)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb)
+
+        current_time = time.time()
+
+        if results.multi_face_landmarks:
+            for face_landmarks in results.multi_face_landmarks:
+                if is_winking(face_landmarks.landmark):
+                    last_expression = "wink"
+                    display_until = current_time + 1.5  # hold for 1.5 sec
+                elif is_smiling(face_landmarks.landmark):
+                    last_expression = "smile"
+                    display_until = current_time + 1.5
+
+        # Determine which image to show
+        if current_time < display_until:
+            if last_expression == "wink":
+                emoji_display = overlay_emoji(blank_display, winking_img)
+            elif last_expression == "smile":
+                emoji_display = overlay_emoji(blank_display, smile_img)
+            else:
+                emoji_display = blank_display.copy()
+        else:
+            emoji_display = blank_display.copy()
+
+        cv2.imshow("Camera", frame)
+        cv2.imshow("Emoji Display", emoji_display)
+
+        if cv2.waitKey(1) & 0xFF == 27:  # ESC
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+
+
+if __name__ == "__main__":
+    main()
