@@ -5,11 +5,16 @@ import numpy as np
 
 # Initialize Mediapipe Face Mesh(Has 468 landmarks that keep track of your facial features)
 mp_face_mesh = mp.solutions.face_mesh
+mp_hands = mp.solutions.hands
+
 face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True)
+hands = mp_hands.Hands(max_num_hands=1)
 
 # Load emoji images
 winking_img = cv2.imread("winking.png", cv2.IMREAD_UNCHANGED) #stores the wink image in a variable without changing its properties e.g png
 smile_img = cv2.imread("smile.png", cv2.IMREAD_UNCHANGED)     #stores the smile image in a variable without changing its properties
+devious_img = cv2.imread("devious.png", cv2.IMREAD_UNCHANGED)
+shocked_img = cv2.imread("shocked.png", cv2.IMREAD_UNCHANGED)
 
 # Overlay function (for transparency support) - Also ensures the image has the right color channels i.e RGBA (A is alpha channel which determines the opacity of a pixel) 
 def overlay_emoji(base_img, emoji):
@@ -68,6 +73,15 @@ def is_smiling(landmarks):
     mouth_height = abs(top_lip.y - bottom_lip.y)
     return (mouth_height / mouth_width) > 0.25
 
+def is_shocked(landmarks):
+    top_lip = landmarks[13]
+    bottom_lip = landmarks[14]
+    mouth_open = abs(top_lip.y - bottom_lip.y)
+    return mouth_open > 0.07
+
+def is_hand_detected(results_hands):
+    return results_hands.multi_hand_landmarks is not None
+
 
 # Main
 def main():
@@ -87,8 +101,11 @@ def main():
         frame = cv2.flip(frame, 1) #Flips the camera horizontally(mirror image)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = face_mesh.process(rgb)
+        results_hands = hands.process(rgb)
 
         current_time = time.time()
+        smiling_now = False
+
 
         if results.multi_face_landmarks:
             for face_landmarks in results.multi_face_landmarks:
@@ -98,6 +115,12 @@ def main():
                 elif is_smiling(face_landmarks.landmark):
                     last_expression = "smile"
                     display_until = current_time + 1.5
+                elif is_shocked(face_landmarks.landmark):
+                    last_expression = "shocked"
+                    display_until = current_time + 1.5
+            if is_hand_detected(results_hands) and smiling_now:
+                last_expression = "devious"
+                display_until = current_time + 1.5
 
         # Determine which image to show
         if current_time < display_until:
@@ -105,6 +128,10 @@ def main():
                 emoji_display = overlay_emoji(blank_display, winking_img)
             elif last_expression == "smile":
                 emoji_display = overlay_emoji(blank_display, smile_img)
+            elif last_expression == "shocked":
+                emoji_display = overlay_emoji(blank_display, shocked_img)
+            elif last_expression == "devious":
+                emoji_display = overlay_emoji(blank_display, devious_img)
             else:
                 emoji_display = blank_display.copy()
         else:
