@@ -1,14 +1,19 @@
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 import time
 import numpy as np
 
 # Initialize Mediapipe Face Mesh(Has 468 landmarks that keep track of your facial features)
 mp_face_mesh = mp.solutions.face_mesh
-mp_hands = mp.solutions.hands
+base_options = python.BaseOptions(model_asset_path='hand_landmarker.task')
+options = vision.HandLandmarkerOptions(base_options=base_options, num_hands=2)
+detector = vision.HandLandmarker.create_from_options(options)
+
 
 face_mesh = mp_face_mesh.FaceMesh(refine_landmarks=True)
-hands = mp_hands.Hands(max_num_hands=1)
+
 
 # Load emoji images
 winking_img = cv2.imread("winking.png", cv2.IMREAD_UNCHANGED) #stores the wink image in a variable without changing its properties e.g png
@@ -80,12 +85,13 @@ def is_shocked(landmarks):
     return mouth_open > 0.07
 
 def is_hand_detected(results_hands):
-    return results_hands.multi_hand_landmarks is not None
+    return results_hands.hand_landmarks is not None and len(results_hands.hand_landmarks) > 0
 
 
 # Main
 def main():
-    cap = cv2.VideoCapture(0) # Opens the laptop camera
+    cap = cv2.VideoCapture(0) # Opens the computer's camera
+    
     cv2.namedWindow("Camera", cv2.WINDOW_NORMAL) #displays the camera window
     cv2.namedWindow("Emoji Display", cv2.WINDOW_NORMAL) #displays the 'emoji' window
 
@@ -101,7 +107,30 @@ def main():
         frame = cv2.flip(frame, 1) #Flips the camera horizontally(mirror image)
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = face_mesh.process(rgb)
-        results_hands = hands.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results_hands = detector.detect(mp_image)
+
+        if results_hands.hand_landmarks:
+
+            for hand_landmarks in results_hands.hand_landmarks:
+                h, w, _ = frame.shape
+
+            for landmark in hand_landmarks:
+                x, y = int(landmark.x * w), int(landmark.y * h)
+                cv2.circle(frame, (x, y), 4, (0, 255, 0), -1)
+
+            connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),     # Thumb
+            (0, 5), (5, 6), (6, 7), (7, 8),     # Index
+            (5, 9), (9, 10), (10, 11), (11, 12),# Middle
+            (9, 13), (13, 14), (14, 15), (15, 16), # Ring
+            (13, 17), (17, 18), (18, 19), (19, 20), # Pinky
+            (0, 17)                             # Palm base connection
+        ]
+            for start, end in connections:
+                x1, y1 = int(hand_landmarks[start].x * w), int(hand_landmarks[start].y * h)
+                x2, y2 = int(hand_landmarks[end].x * w), int(hand_landmarks[end].y * h)
+                cv2.line(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
         current_time = time.time()
         smiling_now = False
