@@ -82,7 +82,7 @@ def is_shocked(landmarks):
     top_lip = landmarks[13]
     bottom_lip = landmarks[14]
     mouth_open = abs(top_lip.y - bottom_lip.y)
-    return mouth_open > 0.07
+    return mouth_open > 0.045
 
 def is_hand_detected(results_hands):
     return results_hands.hand_landmarks is not None and len(results_hands.hand_landmarks) > 0
@@ -141,9 +141,12 @@ def main():
                 if is_winking(face_landmarks.landmark):
                     last_expression = "wink"
                     display_until = current_time + 1.5  # hold for 1.5 sec
+                
                 elif is_smiling(face_landmarks.landmark):
                     last_expression = "smile"
+                    smiling_now = True
                     display_until = current_time + 1.5
+                    
                 elif is_shocked(face_landmarks.landmark):
                     last_expression = "shocked"
                     display_until = current_time + 1.5
