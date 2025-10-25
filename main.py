@@ -4,6 +4,27 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import time
 import numpy as np
+import mysql.connector
+
+
+
+db = mysql.connector.connect(
+
+    host="localhost",
+    port = 1025,       
+    user="root",             # Your MySQL username
+    password="root",# <-- Change this!
+    database="emoji_tracker" # The database you created
+)
+
+cursor = db.cursor()
+
+
+def log_expression(expression_name):
+    """Insert expression data into MySQL"""
+    query = "SELECT * FROM expressions_log;"
+    cursor.execute(query, (expression_name,))
+    db.commit()
 
 # Initialize Mediapipe Face Mesh(Has 468 landmarks that keep track of your facial features)
 mp_face_mesh = mp.solutions.face_mesh
