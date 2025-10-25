@@ -37,12 +37,14 @@ class Database:
 
             # Step 4: Create moods table if it doesn’t exist
             self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS moods (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    mood VARCHAR(50),
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            CREATE TABLE IF NOT EXISTS moods (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                mood VARCHAR(50),
+                confidence FLOAT,
+                duration FLOAT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
             self.conn.commit()
 
         except Error as err:

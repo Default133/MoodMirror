@@ -4,15 +4,15 @@ import numpy as np
 from collections import deque
 import statistics
 from deepface import DeepFace
-from database import Database  # your database.py file
+from database import Database 
 
 # Load emoji images (ensure they are .png with transparent backgrounds)
 emojis = {
     "happy": cv2.imread("smile.png", cv2.IMREAD_UNCHANGED),
-    "sad": cv2.imread("sad.png", cv2.IMREAD_UNCHANGED),
+    #"sad": cv2.imread("sad.png", cv2.IMREAD_UNCHANGED),
     "surprise": cv2.imread("shocked.png", cv2.IMREAD_UNCHANGED),
-    "angry": cv2.imread("angry.png", cv2.IMREAD_UNCHANGED),
-    "neutral": cv2.imread("neutral.png", cv2.IMREAD_UNCHANGED),
+    #"angry": cv2.imread("angry.png", cv2.IMREAD_UNCHANGED),
+    #"neutral": cv2.imread("neutral.png", cv2.IMREAD_UNCHANGED),
     "devious": cv2.imread("devious.png", cv2.IMREAD_UNCHANGED),
 }
 
@@ -32,7 +32,22 @@ def overlay_emoji(base_img, emoji):
         bg = emoji_resized
     return bg
 
-# --- Main Function ---
+def log_mood(self, mood, confidence, duration):
+    if not self.conn:
+        print(" No active database connection. Skipping log.")
+        return
+    try:
+        self.cursor.execute(
+            "INSERT INTO moods (mood, confidence, duration) VALUES (%s, %s, %s)",
+            (mood, confidence, duration)
+        )
+        self.conn.commit()
+        print(f" Logged mood: {mood} | Confidence: {confidence:.1f}% | Duration: {duration:.2f}s")
+    except Exception as e:
+        print(f" Failed to log mood: {e}")
+
+
+# Main Function
 def main():
     db = Database(
         host="localhost",
@@ -48,13 +63,16 @@ def main():
     cv2.namedWindow("Emoji Display", cv2.WINDOW_NORMAL)
 
     # Emotion stability system
-    emotion_history = deque(maxlen=10)
+    emotion_history = deque(maxlen=5)
     last_emotion = None
     display_until = 0
     blank_display = (255 * np.ones((480, 640, 3), dtype=np.uint8))
 
-    frame_skip = 5  # analyze every 5th frame
+    frame_skip = 3  # analyze every 3th frame
     frame_count = 0
+
+    last_log_time = 0
+    log_interval = 5
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -82,7 +100,7 @@ def main():
             confidence = max(result[0]['emotion'].values())
 
             # Filter out low-confidence detections
-            if confidence < 50:
+            if confidence < 80:
                 continue
 
             emotion_history.append(detected_emotion)
@@ -94,6 +112,21 @@ def main():
                 db.log_mood(stable_emotion)
                 last_emotion = stable_emotion
                 display_until = current_time + 2.0  # smoother transitions
+
+            if current_time - last_log_time >= log_interval:
+            # Calculate how long the emotion has lasted
+                if last_emotion == stable_emotion:
+                    duration = current_time - last_log_time
+                else:
+                    duration = 0  # emotion just changed
+
+            # Get the confidence for that emotion
+                confidence = result[0]['emotion'][stable_emotion]
+
+                print(f" Logging emotion: {stable_emotion}")
+                db.log_mood(stable_emotion, confidence, duration)
+                last_log_time = current_time
+
 
         except Exception as e:
             print("Emotion detection error:", e)
