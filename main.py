@@ -5,19 +5,10 @@ from mediapipe.tasks.python import vision
 import time
 import numpy as np
 import mysql.connector
+from database import Database
 
 
 
-db = mysql.connector.connect(
-
-    host="localhost",
-    port = 1025,       
-    user="root",             # Your MySQL username
-    password="root",# <-- Change this!
-    database="emoji_tracker" # The database you created
-)
-
-cursor = db.cursor()
 
 
 def log_expression(expression_name):
@@ -109,8 +100,19 @@ def is_hand_detected(results_hands):
     return results_hands.hand_landmarks is not None and len(results_hands.hand_landmarks) > 0
 
 
+
+
 # Main
 def main():
+    db = Database(
+        host="localhost",
+        port=1025,
+        user="root",
+        password="root",   
+        database="emoji_tracker"
+    )
+    db.connect()
+
     cap = cv2.VideoCapture(0) # Opens the computer's camera
     
     cv2.namedWindow("Camera", cv2.WINDOW_NORMAL) #displays the camera window
@@ -161,19 +163,23 @@ def main():
             for face_landmarks in results.multi_face_landmarks:
                 if is_winking(face_landmarks.landmark):
                     last_expression = "wink"
-                    display_until = current_time + 1.5  # hold for 1.5 sec
+                    display_until = current_time + 1.5
+                    db.log_mood("wink")# hold for 1.5 sec
                 
                 elif is_smiling(face_landmarks.landmark):
                     last_expression = "smile"
                     smiling_now = True
                     display_until = current_time + 1.5
+                    db.log_mood("smile")
                     
                 elif is_shocked(face_landmarks.landmark):
                     last_expression = "shocked"
                     display_until = current_time + 1.5
+                    db.log_mood("shocked")
             if is_hand_detected(results_hands) and smiling_now:
                 last_expression = "devious"
                 display_until = current_time + 1.5
+                db.log_mood("devious")
 
         # Determine which image to show
         if current_time < display_until:
@@ -198,6 +204,7 @@ def main():
 
     cap.release()
     cv2.destroyAllWindows()
+    db.close()
 
 
 
