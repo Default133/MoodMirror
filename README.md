@@ -1,12 +1,12 @@
-# MoodMirror
+# **MoodMirror**
 
 A facial expression recognition program that detects expressions in real time and displays an image matching the detected mood 😊
 
 
 
-#### **Requirements**
+## **Requirements**
 
-Python 3.11
+Python 3.11-3.12
 
 
 
@@ -17,6 +17,14 @@ NumPy
 Mediapipe
 
 cv2
+
+
+
+#### **Installation of libraries**
+
+pip install mediapipe (Only properly supports python 3.9 - python 3.12)
+
+pip install opencv-python
 
 
 
