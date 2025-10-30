@@ -26,7 +26,7 @@ Usage:
 """
 from __future__ import annotations
 
-# ASCII-only file
+
 import sys
 import datetime
 import logging
@@ -40,14 +40,11 @@ from matplotlib.figure import Figure
 
 import numpy as np
 
-# Note: we expect your Database class is implemented in database.py and
-# is thread-safe for writes. For reads we prefer Database._fetchall (if present)
-# otherwise fall back to using db.conn/cursor under db.lock.
+
 from database import Database
 
 logging.basicConfig(level=logging.INFO)
 
-# Helper: safe SQL read using Database API if available, otherwise use db.conn under lock
 def db_read(db: Database, sql: str, params: tuple=()):
     """
     Executes a read-only SQL query and returns rows as a list of tuples.

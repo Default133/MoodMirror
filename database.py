@@ -1,12 +1,5 @@
 # -*- coding: ascii -*-
-"""
-Updated database.py - thread-safe, more robust MySQL helper.
 
-Notes:
-- This file uses only ASCII characters.
-- It uses a per-operation cursor and a lock for thread safety.
-- Added a helper to fetch recent face_moods for reflection/dashboard use.
-"""
 import mysql.connector
 from mysql.connector import Error
 from datetime import datetime

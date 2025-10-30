@@ -1,19 +1,5 @@
 # -*- coding: ascii -*-
-"""
-Patched consolidated main.py
 
-Changes / fixes included:
-- Ensures _notify_listeners and register/unregister exist and are defined before use.
-- Robust cvimg_to_qimage implementation.
-- Haar-precheck + smoothing for "no face" detection to reduce false positives.
-- Robust DeepFace.represent parsing.
-- HTTP SSE server with /status and /events endpoints (prefers DB recent rows when available).
-- DBLogger, TextToSpeech, CameraWorker, and MainWindow integrated.
-- Improved logging and exception handling.
-
-Note: This is the full file to copy into your repo (overwrite existing main.py).
-Run: python main.py
-"""
 import sys
 import time
 import os
