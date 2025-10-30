@@ -41,18 +41,35 @@ from matplotlib.figure import Figure
 import numpy as np
 
 # Note: we expect your Database class is implemented in database.py and
-# is thread-safe for writes. For reads we use _ensure_connection and the
-# connection directly while holding the lock to avoid races.
+# is thread-safe for writes. For reads we prefer Database._fetchall (if present)
+# otherwise fall back to using db.conn/cursor under db.lock.
 from database import Database
 
 logging.basicConfig(level=logging.INFO)
 
-# Helper: safe SQL read with lock from Database instance
+# Helper: safe SQL read using Database API if available, otherwise use db.conn under lock
 def db_read(db: Database, sql: str, params: tuple=()):
     """
     Executes a read-only SQL query and returns rows as a list of tuples.
-    Uses db.lock to avoid concurrent write conflicts.
+    Preference order:
+      1) If Database has a _fetchall(sql, params) method, call it (returns list of dicts or tuples).
+      2) Otherwise fall back to acquiring db.lock and using db.conn.cursor().
+    Returns list of tuples (matching previous behavior).
     """
+    # Try Database._fetchall if available
+    try:
+        if hasattr(db, "_fetchall") and callable(getattr(db, "_fetchall")):
+            rows = db._fetchall(sql, params)
+            # _fetchall in some implementations returns list of dicts; convert to tuples
+            if rows and isinstance(rows[0], dict):
+                # preserve column order by extracting values in cursor order isn't possible here,
+                # so return tuples of values in dict value order (best-effort).
+                return [tuple(r.values()) for r in rows]
+            return rows
+    except Exception:
+        logging.debug("db._fetchall failed, falling back to direct cursor", exc_info=True)
+
+    # Fallback: use db.conn with lock
     db._ensure_connection()
     if not getattr(db, "conn", None):
         return []
@@ -66,6 +83,7 @@ def db_read(db: Database, sql: str, params: tuple=()):
     except Exception as e:
         logging.error("DB read failed: %s", e)
         return []
+
 
 class MplCanvas(FigureCanvas):
     def __init__(self, width=5, height=4, dpi=100):

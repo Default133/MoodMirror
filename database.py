@@ -5,6 +5,7 @@ Updated database.py - thread-safe, more robust MySQL helper.
 Notes:
 - This file uses only ASCII characters.
 - It uses a per-operation cursor and a lock for thread safety.
+- Added a helper to fetch recent face_moods for reflection/dashboard use.
 """
 import mysql.connector
 from mysql.connector import Error
@@ -108,6 +109,42 @@ class Database:
             self.conn = None
             return False
 
+    def _fetchall(self, sql, params=()):
+        """
+        Thread-safe fetch helper that returns a list of dict rows.
+        """
+        self._ensure_connection()
+        if not self.conn:
+            logging.debug("No DB connection available for fetch.")
+            return []
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute(sql, params)
+                columns = cursor.column_names
+                rows = cursor.fetchall()
+                cursor.close()
+            results = []
+            for row in rows:
+                d = {}
+                for i, col in enumerate(columns):
+                    d[col] = row[i]
+                results.append(d)
+            return results
+        except Error as e:
+            logging.error("DB fetch failed: %s", e)
+            try:
+                if self.conn:
+                    self.conn.rollback()
+            except Exception:
+                pass
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+            return []
+
     def log_mood(self, mood, confidence=0.0, duration=0.0, timestamp=None):
         if timestamp is None:
             timestamp = datetime.now()
@@ -137,6 +174,21 @@ class Database:
         if success:
             logging.debug("Logged (face_moods): %s | %s | conf=%.2f | dur=%.2f", person_name, emotion, confidence, duration)
         return success
+
+    def get_recent_face_moods(self, minutes=60, limit=1000):
+        """
+        Returns recent face_moods within the last `minutes`.
+        Result is a list of dicts with keys: person_name, emotion, confidence, duration, timestamp
+        """
+        try:
+            sql = ("SELECT person_name, emotion, confidence, duration, timestamp "
+                   "FROM face_moods WHERE timestamp >= DATE_SUB(NOW(), INTERVAL %s MINUTE) "
+                   "ORDER BY timestamp DESC LIMIT %s")
+            rows = self._fetchall(sql, (int(minutes), int(limit)))
+            return rows
+        except Exception as e:
+            logging.error("Failed to get recent face_moods: %s", e)
+            return []
 
     def close(self):
         try:

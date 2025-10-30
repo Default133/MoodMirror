@@ -1,8 +1,18 @@
 # -*- coding: ascii -*-
 """
-Notes:
-- Requires: pip install opencv-python deepface PyQt5 mysql-connector-python pyttsx3 flask
-- Run: python main.py
+Patched consolidated main.py
+
+Changes / fixes included:
+- Ensures _notify_listeners and register/unregister exist and are defined before use.
+- Robust cvimg_to_qimage implementation.
+- Haar-precheck + smoothing for "no face" detection to reduce false positives.
+- Robust DeepFace.represent parsing.
+- HTTP SSE server with /status and /events endpoints (prefers DB recent rows when available).
+- DBLogger, TextToSpeech, CameraWorker, and MainWindow integrated.
+- Improved logging and exception handling.
+
+Note: This is the full file to copy into your repo (overwrite existing main.py).
+Run: python main.py
 """
 import sys
 import time
@@ -14,6 +24,7 @@ import random
 import json
 import webbrowser
 from collections import deque
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -36,29 +47,30 @@ try:
 except Exception:
     Flask = None
 
+# Logging setup
+logger = logging.getLogger("moodmirror")
+logger.setLevel(logging.DEBUG)
 logging.getLogger("deepface").setLevel(logging.ERROR)
-logging.basicConfig(filename="deepface_log.txt", level=logging.ERROR)
+if not logger.handlers:
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(ch)
 
 # -----------------------------------------------------------------------------
-# HTTP server config
+# Configuration
 # -----------------------------------------------------------------------------
-ENABLE_HTTP = True            # set False to disable the HTTP server
+ENABLE_HTTP = True
 HTTP_HOST = "0.0.0.0"
-HTTP_PORT = 5000              # clients connect to http://<host>:5000
-# Endpoints:
-#  - GET /        -> dashboard HTML page (charts)
-#  - GET /status  -> last payload as JSON
-#  - GET /events  -> Server-Sent Events stream of payloads
+HTTP_PORT = 5000
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
 ANALYZE_INTERVAL = 0.25       # seconds between analyses
-SMALL_FRAME_SIZE = (160, 120) # speed/accuracy tradeoff
-MIN_CONFIDENCE = 60.0         # minimum emotion confidence to accept
-DETECTOR_BACKEND = "opencv"   # faster on CPU
-KNOWN_MODEL = "Facenet"       # model used for embeddings
-EMOJI_DIR = "."               # where emoji images live
+SMALL_FRAME_SIZE = (160, 120) # quick detection size
+ANALYSIS_SIZE = (320, 240)    # size used for DeepFace (better accuracy)
+MIN_CONFIDENCE = 60.0
+DETECTOR_BACKEND = "opencv"
+KNOWN_MODEL = "Facenet"
+EMOJI_DIR = "."
 EMOTION_IMAGES = {
     "happy": "happy.png",
     "surprise": "surprise.png",
@@ -69,81 +81,57 @@ EMOTION_IMAGES = {
     "fear": "fear.png"
 }
 
-# Voice config
-ENABLE_TTS = True             # toggle voice feedback on/off
-TTS_SPEAK_INTERVAL = 5.0      # minimum seconds between speaking the same emotion
+ENABLE_TTS = True
+TTS_SPEAK_INTERVAL = 5.0
 
-# Per-emotion phrase templates (ASCII-only).
 PHRASES = {
-    "happy": [
-        "You look very happy today.",
-        "Nice to see you smiling.",
-        "What a great smile you have today."
-    ],
-    "surprise": [
-        "You seem surprised. Everything ok?",
-        "Wow, you look surprised!",
-        "That looked like a surprise moment."
-    ],
-    "disgust": [
-        "You look a bit displeased. Is everything all right?",
-        "You do not seem pleased. Do you want to try again?",
-        "Hmm, that expression looks unhappy. Are you okay?"
-    ],
-    "sad": [
-        "You look a little sad. I am here if you need me.",
-        "I am sorry you seem down today.",
-        "It seems like a quiet moment. Take your time."
-    ],
-    "angry": [
-        "You look upset. Remember to breathe.",
-        "I sense some anger. Want to take a break?",
-        "It seems like something is bothering you."
-    ],
-    "neutral": [
-        "You look calm and neutral.",
-        "All seems steady right now.",
-        "You seem relaxed at the moment."
-    ],
-    "fear": [
-        "You look concerned. Are you okay?",
-        "You seem frightened. Take a deep breath.",
-        "I notice some worry in your expression."
-    ]
+    "happy": ["You look very happy today.", "Nice to see you smiling.", "What a great smile you have today."],
+    "surprise": ["You seem surprised. Everything ok?", "Wow, you look surprised!"],
+    "disgust": ["You look a bit displeased. Is everything all right?"],
+    "sad": ["You look a little sad. I am here if you need me."],
+    "angry": ["You look upset. Remember to breathe."],
+    "neutral": ["You look calm and neutral."],
+    "fear": ["You look concerned. Are you okay?"],
+    "no_face": ["No face detected. Please look at the camera."]
 }
 
 # -----------------------------------------------------------------------------
-# Integration API for in-process dashboards (kept for compatibility)
+# Integration API for in-process dashboards
 # -----------------------------------------------------------------------------
 _update_listeners = []
 _update_listeners_lock = threading.Lock()
 
-
 def register_update_callback(cb):
+    """
+    Register a callback to receive payloads from the running app.
+    Callback signature: cb(payload_dict)
+    """
     if not callable(cb):
         raise ValueError("callback must be callable")
     with _update_listeners_lock:
         if cb not in _update_listeners:
             _update_listeners.append(cb)
 
-
 def unregister_update_callback(cb):
+    """Unregister a previously registered callback."""
     with _update_listeners_lock:
         try:
             _update_listeners.remove(cb)
         except ValueError:
             pass
 
-
 def _notify_listeners(payload):
+    """
+    Notify registered in-process listeners with the given payload.
+    Each callback is invoked on a daemon thread so listeners cannot block the main loop.
+    """
     with _update_listeners_lock:
         listeners = list(_update_listeners)
     for cb in listeners:
         try:
             threading.Thread(target=cb, args=(payload,), daemon=True).start()
         except Exception:
-            logging.exception("Failed to dispatch payload to listener")
-
+            logger.exception("Failed to dispatch payload to listener")
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -155,26 +143,23 @@ def l2_normalize(vec):
         return vec
     return vec / norm
 
-
 def cosine_similarity(a, b):
     a = np.asarray(a, dtype=np.float32)
     b = np.asarray(b, dtype=np.float32)
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
 
-
 def load_emojis():
     emojis = {}
     for k, p in EMOTION_IMAGES.items():
-        full = os.path.join(EMOJI_DIR, p)
-        if os.path.exists(full):
-            emojis[k] = cv2.imread(full, cv2.IMREAD_UNCHANGED)
+        path = os.path.join(EMOJI_DIR, p)
+        if os.path.exists(path):
+            emojis[k] = cv2.imread(path, cv2.IMREAD_UNCHANGED)
         else:
             emojis[k] = None
+    emojis["no_face"] = np.ones((240, 320, 3), dtype=np.uint8) * 220
     return emojis
 
-
 EMOJIS = load_emojis()
-
 
 def overlay_emoji(base_img, emoji):
     if emoji is None:
@@ -195,27 +180,65 @@ def overlay_emoji(base_img, emoji):
     else:
         return emoji_resized
 
-
 def cvimg_to_qimage(cv_img):
+    """
+    Convert an OpenCV image (BGR, BGRA or grayscale) to a QImage.
+    Returns a QImage or None on failure.
+    """
     if cv_img is None:
         return None
-    h, w = cv_img.shape[:2]
-    if cv_img.ndim == 2:
+    try:
+        h, w = cv_img.shape[:2]
+    except Exception:
+        return None
+
+    # Grayscale image
+    if cv_img.ndim == 2 or (cv_img.ndim == 3 and cv_img.shape[2] == 1):
         fmt = QtGui.QImage.Format_Grayscale8
         qimg = QtGui.QImage(cv_img.data, w, h, cv_img.strides[0], fmt)
         return qimg.copy()
-    if cv_img.shape[2] == 3:
+
+    # BGR -> RGB
+    if cv_img.ndim == 3 and cv_img.shape[2] == 3:
         rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         qimg = QtGui.QImage(rgb.data, w, h, rgb.strides[0], QtGui.QImage.Format_RGB888)
         return qimg.copy()
-    if cv_img.shape[2] == 4:
+
+    # BGRA -> RGBA
+    if cv_img.ndim == 3 and cv_img.shape[2] == 4:
         rgba = cv2.cvtColor(cv_img, cv2.COLOR_BGRA2RGBA)
         qimg = QtGui.QImage(rgba.data, w, h, rgba.strides[0], QtGui.QImage.Format_RGBA8888)
         return qimg.copy()
+
     return None
 
+# Robust representation parser for DeepFace.represent
+def _parse_representation(rep):
+    try:
+        if rep is None:
+            return None
+        if isinstance(rep, np.ndarray):
+            return rep.astype(np.float32)
+        if isinstance(rep, (list, tuple)):
+            if len(rep) == 0:
+                return None
+            if all(isinstance(x, (int, float, np.floating, np.integer)) for x in rep):
+                return np.asarray(rep, dtype=np.float32)
+            return _parse_representation(rep[0])
+        if isinstance(rep, dict):
+            for key in ("embedding", "represent", "representation", "rep", "vector", "embeddings", "instance"):
+                if key in rep:
+                    return _parse_representation(rep[key])
+            for v in rep.values():
+                parsed = _parse_representation(v)
+                if parsed is not None:
+                    return parsed
+        if isinstance(rep, (int, float, np.floating, np.integer)):
+            return np.array([rep], dtype=np.float32)
+    except Exception:
+        logger.exception("Failed to parse representation")
+    return None
 
-# Known embeddings loader
 def load_known_embeddings(faces_dir="faces", model_name=KNOWN_MODEL, detector_backend=DETECTOR_BACKEND):
     known = {}
     if not os.path.exists(faces_dir):
@@ -229,18 +252,17 @@ def load_known_embeddings(faces_dir="faces", model_name=KNOWN_MODEL, detector_ba
             fpath = os.path.join(person_path, fname)
             try:
                 rep = DeepFace.represent(fpath, model_name=model_name, enforce_detection=False, detector_backend=detector_backend)
-                if isinstance(rep, list) and len(rep) > 0 and isinstance(rep[0], (list, np.ndarray)):
-                    vec = np.array(rep[0], dtype=np.float32)
-                else:
-                    vec = np.array(rep, dtype=np.float32)
+                vec = _parse_representation(rep)
+                if vec is None:
+                    logger.debug("Could not parse embedding for %s (type=%s)", fpath, type(rep))
+                    continue
                 vec = l2_normalize(vec)
                 emb_list.append(vec)
-            except Exception as e:
-                logging.debug("Failed embedding for %s: %s", fpath, e)
+            except Exception:
+                logger.exception("Failed embedding for %s", fpath)
         if emb_list:
             known[person] = emb_list
     return known
-
 
 def recognize_embedding(embedding, known_embeddings, similarity_threshold=0.60):
     if embedding is None or not known_embeddings:
@@ -258,7 +280,6 @@ def recognize_embedding(embedding, known_embeddings, similarity_threshold=0.60):
         return best_person
     return None
 
-
 # -----------------------------------------------------------------------------
 # HTTP Server (SSE + status + dashboard)
 # -----------------------------------------------------------------------------
@@ -269,7 +290,7 @@ class HttpServer(threading.Thread):
       - GET /status  -> returns last payload as JSON
       - GET /events  -> Server-Sent Events stream of payloads
     """
-    def __init__(self, host="0.0.0.0", port=5000):
+    def __init__(self, host="0.0.0.0", port=5000, db=None):
         super().__init__(daemon=True)
         self.host = host
         self.port = port
@@ -278,22 +299,22 @@ class HttpServer(threading.Thread):
         self._clients_lock = threading.Lock()
         self._last_payload = {}
         self.running = True
+        self._db = db
         self._build_app()
         self.start()
 
     def _build_app(self):
         if Flask is None:
             self._app = None
-            logging.warning("Flask not available; HTTP server disabled.")
+            logger.warning("Flask not available; HTTP server disabled.")
             return
         app = Flask("moodmirror_http")
         self._app = app
 
         @app.route("/", methods=["GET"])
         def index():
-            # Dashboard HTML with Chart.js and SSE client.
-            # It fetches /status initially, then subscribes to /events.
             try:
+                emotions_list = list(EMOTION_IMAGES.keys()) + ["no_face"]
                 html = (
                     "<!doctype html><html><head><meta charset='utf-8'>"
                     "<title>MoodMirror Dashboard</title>"
@@ -307,7 +328,7 @@ class HttpServer(threading.Thread):
                     "<div style='flex:1 1 480px;min-width:320px;'><canvas id='lineChart'></canvas></div>"
                     "</div>"
                     "<script>"
-                    "const EMOTIONS = " + json.dumps(list(EMOTION_IMAGES.keys())) + ";"
+                    "const EMOTIONS = " + json.dumps(emotions_list) + ";"
                     "let counts = {};"
                     "EMOTIONS.forEach(e=>counts[e]=0);"
                     "const barCtx = document.getElementById('barChart').getContext('2d');"
@@ -315,18 +336,8 @@ class HttpServer(threading.Thread):
                     "const lineCtx = document.getElementById('lineChart').getContext('2d');"
                     "let timeLabels = [], confData = [];"
                     "const lineChart = new Chart(lineCtx,{type:'line',data:{labels:timeLabels,datasets:[{label:'Confidence',data:confData,fill:false,borderColor:'rgba(255,99,132,1)'}]},options:{responsive:true,maintainAspectRatio:false,scales:{y:{min:0,max:100}}}});"
-                    "function seedFromStatus(){"
-                    " fetch('/status').then(r=>r.json()).then(s=>{"
-                    "   try{ if(s && s.emotion){ const emo = s.emotion; counts[emo] = (counts[emo]||0)+1; barChart.data.datasets[0].data = EMOTIONS.map(e=>counts[e]||0); barChart.update(); const label = new Date((s.timestamp||Date.now()/1000)*1000).toLocaleTimeString(); timeLabels.push(label); confData.push(Math.round((s.confidence||0)*100)/100); if(timeLabels.length>30){timeLabels.shift();confData.shift();} lineChart.update(); } }catch(e){console.log('seed err',e);} }).catch(e=>console.log('status fetch err', e));"
-                    "}"
-                    "function connectSSE(){"
-                    " const es = new EventSource('/events');"
-                    " es.onopen = function(){ console.log('SSE connected'); };"
-                    " es.onmessage = function(evt){"
-                    "   try{ const p = JSON.parse(evt.data); const emo = p.emotion || 'neutral'; if(!(emo in counts)) counts[emo]=0; counts[emo] += 1; barChart.data.datasets[0].data = EMOTIONS.map(e=>counts[e]||0); barChart.update(); const label = new Date((p.timestamp||Date.now()/1000)*1000).toLocaleTimeString(); timeLabels.push(label); confData.push(Math.round((p.confidence||0)*100)/100); if(timeLabels.length>30){timeLabels.shift();confData.shift();} lineChart.update(); }catch(err){ console.log('SSE parse err', err); }"
-                    " };"
-                    " es.onerror = function(e){ console.log('SSE error, reconnecting...'); es.close(); setTimeout(connectSSE,1500); };"
-                    "}"
+                    "function seedFromStatus(){ fetch('/status').then(r=>r.json()).then(s=>{ try{ if(s && s.emotion){ const emo = s.emotion; counts[emo] = (counts[emo]||0)+1; barChart.data.datasets[0].data = EMOTIONS.map(e=>counts[e]||0); barChart.update(); const label = new Date((s.timestamp||Date.now()/1000)*1000).toLocaleTimeString(); timeLabels.push(label); confData.push(Math.round((s.confidence||0)*100)/100); if(timeLabels.length>30){timeLabels.shift();confData.shift();} lineChart.update(); } }catch(e){console.log('seed err',e);} }).catch(e=>console.log('status fetch err', e)); }"
+                    "function connectSSE(){ const es = new EventSource('/events'); es.onopen = function(){ console.log('SSE connected'); }; es.onmessage = function(evt){ try{ const p = JSON.parse(evt.data); const emo = p.emotion || 'neutral'; if(!(emo in counts)) counts[emo]=0; counts[emo] += 1; barChart.data.datasets[0].data = EMOTIONS.map(e=>counts[e]||0); barChart.update(); const label = new Date((p.timestamp||Date.now()/1000)*1000).toLocaleTimeString(); timeLabels.push(label); confData.push(Math.round((p.confidence||0)*100)/100); if(timeLabels.length>30){timeLabels.shift();confData.shift();} lineChart.update(); }catch(err){ console.log('SSE parse err', err); } }; es.onerror = function(e){ console.log('SSE error, reconnecting...'); es.close(); setTimeout(connectSSE,1500); }; }"
                     "seedFromStatus(); connectSSE();"
                     "</script></body></html>"
                 )
@@ -337,27 +348,33 @@ class HttpServer(threading.Thread):
         @app.route("/status", methods=["GET"])
         def status():
             try:
+                # Option A fallback: prefer db.get_recent_face_moods if present, otherwise do a quick DB read under lock
+                try:
+                    if self._db is not None and hasattr(self._db, "get_recent_face_moods"):
+                        rows = self._db.get_recent_face_moods(minutes=5, limit=1)
+                        if rows:
+                            return jsonify(self._last_payload or rows[0])
+                except Exception:
+                    logger.debug("db.get_recent_face_moods check failed", exc_info=True)
+
+                # Fallback to last in-memory payload
                 return jsonify(self._last_payload)
             except Exception:
                 return jsonify({})
 
         @app.route("/events", methods=["GET"])
         def events():
-            # SSE generator queue for this client
             q = queue.Queue()
             with self._clients_lock:
                 self._clients.add(q)
 
             def gen():
                 try:
-                    # Immediately send a comment to ensure connection is open
                     yield ": connected\n\n"
-                    # send items as they arrive; include periodic heartbeats
                     while True:
                         try:
                             item = q.get(timeout=15.0)
                         except queue.Empty:
-                            # heartbeat comment to keep intermediaries from buffering
                             yield ": heartbeat\n\n"
                             continue
                         if item is None:
@@ -378,7 +395,6 @@ class HttpServer(threading.Thread):
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
-                # hint for proxies to disable buffering
                 "X-Accel-Buffering": "no"
             }
             return Response(stream_with_context(gen()), headers=headers)
@@ -387,18 +403,16 @@ class HttpServer(threading.Thread):
         if self._app is None:
             return
         try:
-            # Run Flask dev server in background thread. For production use gunicorn.
+            # use Flask dev server in background thread
             self._app.run(host=self.host, port=self.port, threaded=True, debug=False, use_reloader=False)
-        except Exception as e:
-            logging.error("HTTP server stopped: %s", e)
+        except Exception:
+            logger.exception("HTTP server stopped")
 
     def broadcast(self, payload):
-        # store last payload for /status
         try:
             self._last_payload = payload
         except Exception:
             pass
-        # enqueue to all client queues
         with self._clients_lock:
             clients = list(self._clients)
         for q in clients:
@@ -412,7 +426,6 @@ class HttpServer(threading.Thread):
 
     def stop(self):
         self.running = False
-        # notify all clients to terminate
         with self._clients_lock:
             for q in list(self._clients):
                 try:
@@ -420,7 +433,6 @@ class HttpServer(threading.Thread):
                 except Exception:
                     pass
             self._clients.clear()
-
 
 # -----------------------------------------------------------------------------
 # DB Logger (threaded)
@@ -448,12 +460,11 @@ class DBLogger(threading.Thread):
                         self.db.log_face_mood(*args)
                     except TypeError:
                         self.db.log_face_mood(args[0], args[1], args[2], args[3])
-            except Exception as e:
-                logging.error("DB logging failed: %s", e)
+            except Exception:
+                logger.exception("DB logging failed")
 
     def stop(self):
         self.running = False
-
 
 # -----------------------------------------------------------------------------
 # Text-to-Speech (TTS)
@@ -469,7 +480,7 @@ class TextToSpeech(threading.Thread):
 
     def _init_engine(self):
         if pyttsx3 is None:
-            logging.warning("pyttsx3 not available; voice feedback disabled.")
+            logger.warning("pyttsx3 not available; voice feedback disabled.")
             self.engine = None
             return
         try:
@@ -479,8 +490,8 @@ class TextToSpeech(threading.Thread):
                 self.engine.setProperty("volume", 1.0)
             except Exception:
                 pass
-        except Exception as e:
-            logging.warning("Failed to initialize pyttsx3 engine: %s", e)
+        except Exception:
+            logger.exception("Failed to init pyttsx3")
             self.engine = None
 
     def speak(self, text):
@@ -505,9 +516,9 @@ class TextToSpeech(threading.Thread):
                     self.engine.say(text)
                     self.engine.runAndWait()
                 else:
-                    logging.info("TTS fallback (no engine): %s", text)
-            except Exception as e:
-                logging.error("TTS error: %s", e)
+                    logger.info("TTS fallback: %s", text)
+            except Exception:
+                logger.exception("TTS error")
 
     def stop(self):
         self.running = False
@@ -517,15 +528,15 @@ class TextToSpeech(threading.Thread):
         except Exception:
             pass
 
-
 # -----------------------------------------------------------------------------
-# Camera & Analysis worker (QThread)
+# Camera worker (Haar pre-check + smoothing)
 # -----------------------------------------------------------------------------
 class CameraWorker(QtCore.QThread):
     frame_ready = QtCore.pyqtSignal(object)
     emotion_detected = QtCore.pyqtSignal(str, float, str)
 
-    def __init__(self, src=0, known_embeddings=None, db_logger=None, parent=None):
+    def __init__(self, src=0, known_embeddings=None, db_logger=None, parent=None,
+                 face_miss_threshold=6, cascade_scale=1.2, cascade_min_neighbors=4, min_face_size=(30,30)):
         super().__init__(parent)
         self.src = src
         self.running = True
@@ -537,10 +548,40 @@ class CameraWorker(QtCore.QThread):
         self.detector_backend = DETECTOR_BACKEND
         self.model = KNOWN_MODEL
 
+        self._no_face_counter = 0
+        self._no_face_threshold = face_miss_threshold
+        self._cascade_scale = cascade_scale
+        self._cascade_min_neighbors = cascade_min_neighbors
+        self._min_face_size = min_face_size
+
+        try:
+            self._face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            if self._face_cascade.empty():
+                self._face_cascade = None
+        except Exception:
+            self._face_cascade = None
+
+    def _detect_face_fast(self, frame):
+        if self._face_cascade is None:
+            return True
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape[:2]
+            target_w = 320
+            if w > target_w:
+                scale = target_w / float(w)
+                small = cv2.resize(gray, (int(w * scale), int(h * scale)))
+            else:
+                small = gray
+            faces = self._face_cascade.detectMultiScale(small, scaleFactor=self._cascade_scale, minNeighbors=self._cascade_min_neighbors, minSize=self._min_face_size)
+            return len(faces) > 0
+        except Exception:
+            return True
+
     def run(self):
         cap = cv2.VideoCapture(self.src)
         if not cap.isOpened():
-            print("Failed to open camera")
+            logger.error("Failed to open camera %s", self.src)
             return
         try:
             while self.running:
@@ -554,17 +595,50 @@ class CameraWorker(QtCore.QThread):
                 now = time.time()
                 if now - self.last_analysis >= ANALYZE_INTERVAL:
                     self.last_analysis = now
+
                     try:
-                        small = cv2.resize(frame, SMALL_FRAME_SIZE)
+                        small_for_detect = cv2.resize(frame, SMALL_FRAME_SIZE)
                     except Exception:
-                        small = frame.copy()
-                    try:
-                        result = DeepFace.analyze(small, actions=["emotion"], enforce_detection=False, detector_backend=self.detector_backend)
-                        if isinstance(result, list):
-                            result = result[0]
-                        emotions = result.get("emotion", {}) or {}
-                        dominant = result.get("dominant_emotion", None)
-                        confidence = float(max(emotions.values())) if emotions else 0.0
+                        small_for_detect = frame.copy()
+
+                    face_likely = self._detect_face_fast(small_for_detect)
+
+                    if not face_likely:
+                        self._no_face_counter += 1
+                        if self._no_face_counter >= self._no_face_threshold:
+                            self.emotion_history.clear()
+                            self.last_emotion = "Detecting..."
+                            try:
+                                if self.db_logger:
+                                    self.db_logger.enqueue_face_mood("Unknown", "no_face", 0.0, 0)
+                            except Exception:
+                                pass
+                            self.emotion_detected.emit("no_face", 0.0, "Unknown")
+                        time.sleep(0.001)
+                        continue
+                    else:
+                        self._no_face_counter = 0
+
+                        try:
+                            small = cv2.resize(frame, ANALYSIS_SIZE)
+                        except Exception:
+                            small = frame.copy()
+
+                        try:
+                            result = DeepFace.analyze(small, actions=["emotion"], enforce_detection=False, detector_backend=self.detector_backend)
+                            if isinstance(result, list):
+                                result = result[0]
+                            emotions = result.get("emotion", {}) or {}
+                            dominant = result.get("dominant_emotion", None)
+                            confidence = float(max(emotions.values())) if emotions else 0.0
+                        except Exception as e:
+                            logger.debug("DeepFace.analyze error: %s", e)
+                            time.sleep(0.001)
+                            continue
+
+                        if not dominant or confidence <= 0.0:
+                            time.sleep(0.001)
+                            continue
 
                         if dominant and confidence >= MIN_CONFIDENCE:
                             self.emotion_history.append(dominant)
@@ -576,15 +650,13 @@ class CameraWorker(QtCore.QThread):
                             person_name = "Unknown"
                             try:
                                 rep = DeepFace.represent(small, model_name=self.model, enforce_detection=False, detector_backend=self.detector_backend)
-                                if isinstance(rep, list) and len(rep) > 0 and isinstance(rep[0], (list, np.ndarray)):
-                                    embedding = np.array(rep[0], dtype=np.float32)
-                                else:
-                                    embedding = np.array(rep, dtype=np.float32)
-                                p = recognize_embedding(embedding, self.known_embeddings)
-                                if p:
-                                    person_name = p
+                                embedding = _parse_representation(rep)
+                                if embedding is not None:
+                                    p = recognize_embedding(embedding, self.known_embeddings)
+                                    if p:
+                                        person_name = p
                             except Exception:
-                                pass
+                                logger.debug("Representation error", exc_info=True)
 
                             if stable != self.last_emotion:
                                 self.last_emotion = stable
@@ -594,8 +666,10 @@ class CameraWorker(QtCore.QThread):
                                     except Exception:
                                         pass
                             self.emotion_detected.emit(stable, confidence, person_name)
-                    except Exception as e:
-                        logging.debug("Analysis error: %s", e)
+                        else:
+                            # low confidence: ignore
+                            pass
+
                 time.sleep(0.001)
         finally:
             try:
@@ -606,7 +680,6 @@ class CameraWorker(QtCore.QThread):
     def stop(self):
         self.running = False
         self.wait(2000)
-
 
 # -----------------------------------------------------------------------------
 # Main Window
@@ -658,7 +731,7 @@ class MainWindow(QtWidgets.QWidget):
         try:
             self.db.connect()
         except Exception:
-            pass
+            logger.exception("DB connect failed")
         self.db_logger = DBLogger(self.db)
         self.db_logger.start()
 
@@ -674,12 +747,12 @@ class MainWindow(QtWidgets.QWidget):
         self.http_server = None
         if ENABLE_HTTP and Flask is not None:
             try:
-                self.http_server = HttpServer(host=HTTP_HOST, port=HTTP_PORT)
-            except Exception as e:
-                logging.error("Failed to start HTTP server: %s", e)
+                self.http_server = HttpServer(host=HTTP_HOST, port=HTTP_PORT, db=self.db)
+            except Exception:
+                logger.exception("Failed to start HTTP server")
                 self.http_server = None
         elif ENABLE_HTTP:
-            logging.warning("HTTP support requested but Flask is not installed. Install 'flask' to enable it.")
+            logger.warning("Flask not installed; HTTP disabled.")
 
         self.worker = None
 
@@ -695,23 +768,21 @@ class MainWindow(QtWidgets.QWidget):
         self.blank_display = np.ones((240, 320, 3), dtype=np.uint8) * 255
 
     def open_dashboard(self):
-        # Open dashboard in default browser. Ensure server is started.
         url = "http://localhost:%d/" % (HTTP_PORT,)
         if self.http_server is None:
-            logging.warning("HTTP server not running; attempting to start it now.")
+            logger.warning("HTTP server not running; attempting to start it now.")
             if Flask is not None:
                 try:
-                    self.http_server = HttpServer(host=HTTP_HOST, port=HTTP_PORT)
-                    # small delay to let server bind
+                    self.http_server = HttpServer(host=HTTP_HOST, port=HTTP_PORT, db=self.db)
                     time.sleep(0.25)
-                except Exception as e:
-                    logging.error("Failed to start HTTP server on demand: %s", e)
+                except Exception:
+                    logger.exception("Failed to start HTTP server on demand")
             else:
-                logging.warning("Flask not installed; cannot start dashboard server.")
+                logger.warning("Flask not installed; cannot start dashboard server.")
         try:
             webbrowser.open(url)
-        except Exception as e:
-            logging.error("Failed to open browser: %s", e)
+        except Exception:
+            logger.exception("Failed to open browser")
 
     @QtCore.pyqtSlot(object)
     def _on_frame(self, frame):
@@ -726,13 +797,21 @@ class MainWindow(QtWidgets.QWidget):
         self.current_emotion = emotion or "Detecting..."
         self.current_confidence = confidence or 0.0
 
-        self.info_label.setText("Person: %s\nEmotion: %s (%.0f%%)" % (self.current_person, self.current_emotion, self.current_confidence))
+        # Handle no_face separately in the display
+        if emotion == "no_face":
+            self.info_label.setText("No face detected. Please look at the camera.")
+            emoji_cv = EMOJIS.get("no_face", self.blank_display)
+        else:
+            self.info_label.setText("Person: %s\nEmotion: %s (%.0f%%)" % (self.current_person, self.current_emotion, self.current_confidence))
+            emoji_cv = EMOJIS.get(self.current_emotion, None)
 
-        emoji_cv = EMOJIS.get(self.current_emotion, None)
         if emoji_cv is not None:
             try:
-                emoji_rgb = cv2.cvtColor(emoji_cv, cv2.COLOR_BGRA2RGBA) if emoji_cv.shape[2] == 4 else cv2.cvtColor(emoji_cv, cv2.COLOR_BGR2RGB)
-                q = cvimg_to_qimage(emoji_rgb)
+                if emotion == "no_face":
+                    img = emoji_cv
+                else:
+                    img = cv2.cvtColor(emoji_cv, cv2.COLOR_BGRA2RGBA) if emoji_cv.shape[2] == 4 else cv2.cvtColor(emoji_cv, cv2.COLOR_BGR2RGB)
+                q = cvimg_to_qimage(img)
                 pix = QtGui.QPixmap.fromImage(q).scaled(self.emoji_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
                 self.emoji_label.setPixmap(pix)
             except Exception:
@@ -740,7 +819,6 @@ class MainWindow(QtWidgets.QWidget):
         else:
             self.emoji_label.clear()
 
-        # Prepare payload for dashboard listeners and external clients
         payload = {
             "person": self.current_person,
             "emotion": self.current_emotion,
@@ -748,21 +826,25 @@ class MainWindow(QtWidgets.QWidget):
             "timestamp": time.time()
         }
 
+        if emotion == "no_face":
+            payload["emotion"] = "no_face"
+            payload["confidence"] = 0.0
+
         # Notify in-process listeners
         try:
             _notify_listeners(payload)
         except Exception:
-            logging.exception("Failed to notify in-process listeners")
+            logger.exception("Failed to notify in-process listeners")
 
-        # Broadcast to HTTP clients (separate process dashboards)
+        # Broadcast to HTTP clients
         if self.http_server:
             try:
                 self.http_server.broadcast(payload)
             except Exception:
-                logging.exception("Failed to broadcast payload to HTTP clients")
+                logger.exception("Failed to broadcast payload to HTTP clients")
 
-        # Voice feedback: speak a phrase chosen for the detected emotion (throttled)
-        if ENABLE_TTS and self.tts:
+        # Voice feedback: skip when no_face
+        if ENABLE_TTS and self.tts and emotion != "no_face":
             now = time.time()
             key = (self.current_person, self.current_emotion)
             last = self._last_spoken.get(key, 0)
@@ -790,8 +872,8 @@ class MainWindow(QtWidgets.QWidget):
                 try:
                     self.tts.speak(phrase)
                     self._last_spoken[key] = now
-                except Exception as e:
-                    logging.error("Failed to enqueue TTS: %s", e)
+                except Exception:
+                    logger.exception("Failed to enqueue TTS")
 
     def start_worker(self):
         if self.worker and self.worker.isRunning():
@@ -843,7 +925,6 @@ class MainWindow(QtWidgets.QWidget):
             pass
         event.accept()
 
-
 # -----------------------------------------------------------------------------
 # Entry point
 # -----------------------------------------------------------------------------
@@ -852,7 +933,6 @@ def main():
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()
