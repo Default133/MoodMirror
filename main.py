@@ -1,13 +1,5 @@
 # -*- coding: ascii -*-
 """
-Updated main.py - PyQt5 GUI front-end integrated with DeepFace analysis.
-
-This update fixes issues with the dashboard not rendering charts by:
-- Improving the SSE endpoint (correct headers, keep-alive heartbeats to avoid buffering).
-- Having the dashboard page fetch /status on load to seed charts.
-- Making the dashboard HTML/CSS/JS more robust (responsive canvases, reconnect logic).
-- Adding safer JSON serialization and small server-side improvements.
-
 Notes:
 - Requires: pip install opencv-python deepface PyQt5 mysql-connector-python pyttsx3 flask
 - Run: python main.py
